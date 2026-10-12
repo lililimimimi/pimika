@@ -1,0 +1,20 @@
+.env
+.env.local
+
+# Logs written by scripts/start.sh
+logs/
+
+# Python bytecode
+__pycache__/
+
+# Tauri desktop shell: build output and generated files
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+
+# Packaged desktop build output (PyInstaller)
+backend/packaging/build/
+backend/packaging/dist/
+backend/packaging/build.log
+backend/packaging/*.spec
+pi-bridge/packaging/dist/
+pi-bridge/packaging/build.log

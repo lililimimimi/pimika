@@ -1,0 +1,260 @@
+/**
+ * Execution preview.
+ *
+ * Before the first write tool call, the bridge pauses and asks the user to
+ * confirm the agent's intended steps. This module holds the pieces that are
+ * independent of Express / the Pi SDK:
+ *
+ * - `buildPreview()` derives a human-readable step list from the agent's own
+ *   plan text, falling back to a description of the pending tool call.
+ * - `PreviewRegistry` stores pending previews and resolves them on
+ *   confirm / cancel. A preview waits for the user however long that takes.
+ * - `needsPreview()` decides, for each tool call, whether it has to wait.
+ */
+
+import { resolve, sep } from 'node:path'
+
+/** Tools that never modify state — they bypass the preview gate. */
+export const READ_ONLY_TOOLS = new Set(['read', 'grep', 'find', 'ls'])
+
+// Shell commands that only read. Anything else (or anything with redirects,
+// substitutions or unknown commands) counts as a write and asks for confirmation.
+const READ_ONLY_COMMANDS = new Set([
+  'ls',
+  'cat',
+  'pwd',
+  'head',
+  'tail',
+  'wc',
+  'echo',
+  'which',
+  'grep',
+  'rg',
+  'file',
+  'stat',
+  'du',
+  'df',
+  'date',
+  'whoami',
+  'cd',
+  'sort',
+  'uniq',
+  'cut',
+  'tr',
+  'tree',
+])
+const READ_ONLY_GIT = new Set([
+  'status',
+  'log',
+  'diff',
+  'show',
+  'branch',
+  'remote',
+  'rev-parse',
+  'ls-files',
+  'ls-tree',
+  'blame',
+  'show-ref',
+  'describe',
+])
+// These only print their version when given just a version flag
+const VERSION_COMMANDS = new Set(['node', 'npm', 'python', 'python3', 'git'])
+// find can delete or run things with these flags; without them it only lists
+const FIND_WRITE_FLAGS = /\s-(delete|exec|execdir|ok|okdir|fprint\w*)\b/
+
+/**
+ * sed that only prints: -n, no in-place edit (-i), and no 'w' command that writes a file.
+ * Anything unclear counts as a write and asks.
+ */
+function isReadOnlySed(part: string): boolean {
+  const words = part.trim().split(/\s+/)
+  const inPlace = words.some((w) => w.startsWith('-i') || w.startsWith('--in-place'))
+  const printsOnly = words.includes('-n')
+  const writesFile = /(^|[;'"\s])[wW]\s+\S/.test(part)
+  return printsOnly && !inPlace && !writesFile
+}
+
+function isReadOnlyShell(command: string): boolean {
+  // Discarding output to /dev/null, or merging stderr into stdout (2>&1), writes no file,
+  // so these don't count as redirects
+  const withoutHarmless = command.replace(/\s*2?>{1,2}\s*\/dev\/null/g, '').replace(/\s*2>&1/g, '')
+  if (/[>`]|\$\(/.test(withoutHarmless)) return false // redirects and substitutions can write
+  const parts = withoutHarmless.split(/\s*(?:\|\||&&|;|\|)\s*/).filter(Boolean)
+  return (
+    parts.length > 0 &&
+    parts.every((part) => {
+      const [cmd, sub] = part.trim().split(/\s+/)
+      if (cmd === 'git') return READ_ONLY_GIT.has(sub ?? '')
+      if (cmd === 'find') return !FIND_WRITE_FLAGS.test(part)
+      if (cmd === 'sed') return isReadOnlySed(part)
+      // Bare env lists the variables; with arguments it runs a command
+      if (cmd === 'env') return part.trim() === 'env'
+      // Asking for a version only prints it
+      if (VERSION_COMMANDS.has(cmd)) return sub === '-v' || sub === '--version' || sub === '-V'
+      return READ_ONLY_COMMANDS.has(cmd)
+    })
+  )
+}
+
+export function isWriteTool(toolName: string, args: ToolArgs = {}): boolean {
+  if (toolName === 'bash') {
+    const command = str(args.command)
+    return !(command && isReadOnlyShell(command))
+  }
+  return !READ_ONLY_TOOLS.has(toolName)
+}
+
+/**
+ * Whether one tool call must wait for the user. Every write asks on its own: confirming an
+ * earlier write does not approve the next one in the same turn. With auto edits on, an edit
+ * inside the project does not ask; shell commands and outside paths still do.
+ */
+export function needsPreview(
+  ctrl: { enabled: boolean; autoEdits: boolean; cwd: string; cancelled: boolean },
+  toolName: string,
+  args: ToolArgs,
+): boolean {
+  if (!ctrl.enabled || ctrl.cancelled) return false
+  if (ctrl.autoEdits && isProjectEdit(toolName, args, ctrl.cwd)) return false
+  return isWriteTool(toolName, args)
+}
+
+/**
+ * True for a file edit or new file whose path is inside the project folder.
+ * Shell commands never count (they can write anywhere), and neither does a path outside the project.
+ */
+export function isProjectEdit(toolName: string, args: ToolArgs, cwd: string): boolean {
+  if (toolName !== 'edit' && toolName !== 'write') return false
+  const target = str(args.path) ?? str(args.file_path) ?? str(args.filePath)
+  if (!target || !cwd) return false
+  const root = resolve(cwd)
+  const full = resolve(root, target)
+  return full === root || full.startsWith(root + sep)
+}
+
+/** Instruction used to elicit a step-by-step plan from the agent. */
+export const PREVIEW_PROMPT =
+  'Before using any tool that writes, edits, or executes, first reply with a ' +
+  'short numbered list of the steps you intend to take. Keep each step to one line.'
+
+type ToolArgs = Record<string, unknown>
+
+function str(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/** One-line, human-readable description of a tool call. */
+export function describeToolCall(toolName: string, args: ToolArgs = {}): string {
+  const path = str(args.path) ?? str(args.file_path) ?? str(args.filePath)
+  switch (toolName) {
+    case 'read':
+      return path ? `Read ${path}` : 'Read file'
+    case 'write':
+      return path ? `Write ${path}` : 'Write file'
+    case 'edit':
+      return path ? `Edit ${path}` : 'Edit file'
+    case 'bash':
+    case 'powershell': {
+      const command = str(args.command) ?? ''
+      const short = command.length > 60 ? `${command.slice(0, 60)}…` : command
+      return short ? `Run ${short}` : 'Run command'
+    }
+    case 'grep':
+      return 'Search code'
+    case 'find':
+      return 'Find files'
+    case 'ls':
+      return path ? `List ${path}` : 'List directory'
+    default:
+      return `Call ${toolName}`
+  }
+}
+
+/**
+ * Pull a step list out of the agent's plan text. Understands numbered and
+ * bulleted markdown lists; returns [] when the text contains no list.
+ */
+export function extractSteps(text: string): string[] {
+  if (!text) return []
+  const steps: string[] = []
+  for (const raw of text.split('\n')) {
+    const match = raw.match(/^\s*(?:\d+[.)]|[-*+])\s+(.+?)\s*$/)
+    if (!match) continue
+    const step = match[1].replace(/\*\*/g, '').trim()
+    if (step) steps.push(step)
+  }
+  return steps
+}
+
+/**
+ * Build the preview step list for a pending tool call. Prefers the plan the
+ * agent already wrote; otherwise describes the tool call itself.
+ */
+export function buildPreview(input: {
+  assistantText?: string
+  toolName: string
+  args?: ToolArgs
+  maxSteps?: number
+}): string[] {
+  const maxSteps = input.maxSteps ?? 8
+  const steps = extractSteps(input.assistantText ?? '')
+  const source = steps.length > 0 ? steps : [describeToolCall(input.toolName, input.args)]
+  return source.slice(0, maxSteps)
+}
+
+// ── Pending preview registry ─────────────────────────────────────────────
+
+export type PreviewDecision = 'confirm' | 'cancel'
+
+/**
+ * Cancel the given previews that are still waiting, so their tool calls stop and the turn ends.
+ * Used when the client has gone: nobody is left to answer. Returns how many were cancelled.
+ */
+export function cancelPreviews(registry: PreviewRegistry, previewIds: Iterable<string>): number {
+  let cancelled = 0
+  for (const id of previewIds) {
+    if (registry.resolve(id, 'cancel')) cancelled++
+  }
+  return cancelled
+}
+
+export class PreviewRegistry {
+  private resolvers = new Map<string, (decision: PreviewDecision) => void>()
+  private remembered = new Set<string>()
+
+  /** Register a preview and wait until the user confirms or cancels it. There is no timeout. */
+  wait(previewId: string): Promise<PreviewDecision> {
+    return new Promise<PreviewDecision>((resolve) => {
+      this.resolvers.set(previewId, (decision) => {
+        this.resolvers.delete(previewId)
+        resolve(decision)
+      })
+    })
+  }
+
+  /**
+   * Confirm or cancel a pending preview. Returns false if unknown or already answered.
+   * `remember` asks that a confirmed command be allowed from now on (see wasRemembered).
+   */
+  resolve(previewId: string, decision: PreviewDecision, remember = false): boolean {
+    const finish = this.resolvers.get(previewId)
+    if (!finish) return false
+    if (remember && decision === 'confirm') this.remembered.add(previewId)
+    finish(decision)
+    return true
+  }
+
+  /** True if the user confirmed this preview and asked to allow the command from now on */
+  wasRemembered(previewId: string): boolean {
+    return this.remembered.has(previewId)
+  }
+
+  has(previewId: string): boolean {
+    return this.resolvers.has(previewId)
+  }
+
+  /** Forget all pending previews (shutdown / tests). */
+  dispose(): void {
+    this.resolvers.clear()
+  }
+}
